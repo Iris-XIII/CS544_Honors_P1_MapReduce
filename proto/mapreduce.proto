@@ -1,0 +1,70 @@
+
+syntax = "proto3";
+
+package mapreduce;
+
+// Worker-side RPCs called by the boss.
+service WorkerService {
+    // Assign a map task to a worker.
+    rpc RunMap(MapTaskRequest) returns (TaskReply);
+
+    // Assign a reduce task to a worker.
+    rpc RunReduce(ReduceTaskRequest) returns (TaskReply);
+
+    // Query the current status of a task attempt.
+    rpc GetTaskStatus(TaskStatusRequest) returns (TaskStatusReply);
+}
+
+// Possible lifecycle states for a task attempt.
+enum TaskState {
+    UNKNOWN = 0;
+    PENDING = 1;
+    RUNNING = 2;
+    COMPLETED = 3;
+    FAILED = 4;
+}
+
+// Request sent by the boss to launch a map task.
+message MapTaskRequest {
+    string job_id = 1;       // Unique job identifier
+    int32 task_id = 2;       // Logical map task ID
+    int32 attempt_id = 3;    // Attempt number (for speculative execution)
+    string input_path = 4;   // Shared input file path
+    string job_file = 5;     // User-defined map/reduce Python file
+    int32 num_reducers = 6;  // Number of reduce partitions
+    int64 start_line = 7;    // Inclusive start line
+    int64 end_line = 8;      // Exclusive end line
+}
+
+ // Request sent by the boss to assign a reduce task to a worker.
+message ReduceTaskRequest {
+    string job_id = 1;            // Unique identifier for the job
+    int32 task_id = 2;            // Logical reduce task ID
+    int32 attempt_id = 3;         // Execution attempt ID (supports speculative execution)
+    string intermediate_path = 4; // Location of intermediate map output
+    string output_path = 5;       // Destination for this attempt's reduce output
+    string job_file = 6;          // File containing user-defined reduce function
+}
+
+// Response indicating whether the worker accepted a task.
+// Acceptance does not mean the task has finished.
+message TaskReply {
+    bool accepted = 1;           // Whether the task was accepted
+    string message = 2;          // Confirmation or rejection details
+}
+
+// Request sent by the boss to check a task's current status.
+message TaskStatusRequest {
+    string job_id = 1;           // Job containing the task
+    int32 task_id = 2;           // Logical task ID
+    int32 attempt_id = 3;        // Specific attempt being queried
+    bool is_reduce = 4;          // True for reduce tasks, false for map tasks
+}
+
+// Worker response containing the current status of a task attempt.
+message TaskStatusReply {
+    TaskState state = 1;         // PENDING, RUNNING, COMPLETED, or FAILED
+    double elapsed_seconds = 2;  // Seconds elapsed since this attempt started
+    string output_path = 3;      // Output path if the attempt completed successfully
+    string error = 4;            // Error details if the attempt failed
+}
