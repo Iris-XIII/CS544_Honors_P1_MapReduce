@@ -126,5 +126,80 @@ class TestWorkerIntegration(unittest.TestCase):
             channel.close()
 
 
+    def test_map_attempt_isolation(self):
+        """Different attempts must not overwrite each other's output."""
+
+        import uuid
+
+        job_id = f"isolation_{uuid.uuid4().hex}"
+
+        input_path = ROOT / "examples/data/input.txt"
+        job_file = ROOT / "examples/wordcount.py"
+
+        with grpc.insecure_channel("localhost:50051") as channel:
+            stub = pb2_grpc.WorkerServiceStub(channel)
+
+            output_paths = []
+
+            for attempt_id in [0, 1]:
+                response = stub.RunMap(
+                    pb2.MapTaskRequest(
+                        job_id=job_id,
+                        task_id=0,
+                        attempt_id=attempt_id,
+                        input_path=str(input_path),
+                        job_file=str(job_file),
+                        num_reducers=2,
+                        start_line=0,
+                        end_line=2,
+                    ),
+                    timeout=5,
+                )
+
+                self.assertTrue(response.accepted)
+
+            for attempt_id in [0, 1]:
+                # Query the status of this specific attempt.
+                for _ in range(50):
+                    status = stub.GetTaskStatus(
+                        pb2.TaskStatusRequest(
+                            job_id=job_id,
+                            task_id=0,
+                            attempt_id=attempt_id,
+                            is_reduce=False,
+                        ),
+                        timeout=5,
+                    )
+
+                    if status.state == pb2.COMPLETED:
+                        break
+
+                    if status.state == pb2.FAILED:
+                        self.fail(status.error)
+
+                    time.sleep(0.1)
+                else:
+                    self.fail("Attempt did not complete")
+
+                output_paths.append(Path(status.output_path))
+
+            # Both attempts should have separate output directories.
+            self.assertNotEqual(output_paths[0], output_paths[1])
+
+            # Both directories must exist.
+            self.assertTrue(output_paths[0].is_dir())
+            self.assertTrue(output_paths[1].is_dir())
+
+            # Both attempts should produce valid intermediate files.
+            for attempt_id, output_dir in enumerate(output_paths):
+                for reducer_id in range(2):
+                    partition = output_dir / (
+                        f"map_0_attempt_{attempt_id}_"
+                        f"reduce_{reducer_id}.jsonl"
+                    )
+                    self.assertTrue(partition.exists())
+
+
+
 if __name__ == "__main__":
     unittest.main()
