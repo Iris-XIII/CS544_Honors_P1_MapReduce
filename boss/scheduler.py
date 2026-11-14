@@ -1,7 +1,6 @@
 """Single-job, push-based scheduling against the existing Worker gRPC API."""
 
 from collections import deque
-import json
 import logging
 import math
 from pathlib import Path
@@ -126,26 +125,24 @@ class Scheduler:
         ) for task_id, (start, end) in enumerate(line_ranges(num_lines, spec.num_maps))]
         map_outputs = self._run_phase(record.job_id, maps, is_reduce=False)
 
-        # This is a proposed Worker integration contract, documented in docs/.
-        # The manifest contains exactly one successful output per logical map.
-        manifest = workspace / "map-outputs.json"
-        manifest.write_text(json.dumps({
-            "version": 1,
-            "job_id": record.job_id,
-            "num_reducers": spec.num_reducers,
-            "map_outputs": [
-                {"task_id": task_id, "attempt_id": 0, "output_path": path}
-                for task_id, path in sorted(map_outputs.items())
-            ],
-        }, indent=2) + "\n", encoding="utf-8")
         attempts = workspace / "reduce"
         attempts.mkdir()
-        reduces = [worker_pb2.ReduceTaskRequest(
-            job_id=record.job_id, task_id=task_id, attempt_id=0,
-            intermediate_path=str(manifest),
-            output_path=str(attempts / f"part-{task_id:05d}-attempt-0.jsonl"),
-            job_file=spec.job_file,
-        ) for task_id in range(spec.num_reducers)]
+        reduces = []
+        for reducer_id in range(spec.num_reducers):
+            # Match Iris's shuffle filenames. Select one successful attempt per
+            # logical map; never glob other attempts into the reducer's input.
+            input_paths = []
+            for map_id, directory in sorted(map_outputs.items()):
+                partition = Path(directory) / f"map_{map_id}_attempt_0_reduce_{reducer_id}.jsonl"
+                if not partition.is_file():
+                    raise JobFailed(f"Map {map_id} is missing reducer {reducer_id} partition: {partition}")
+                input_paths.append(str(partition))
+            reduces.append(worker_pb2.ReduceTaskRequest(
+                job_id=record.job_id, task_id=reducer_id, attempt_id=0,
+                input_paths=input_paths,
+                output_path=str(attempts),  # Worker creates its attempt file here.
+                job_file=spec.job_file,
+            ))
         reduce_outputs = self._run_phase(record.job_id, reduces, is_reduce=True)
 
         # Publish only after every reducer succeeds. Copy into a temporary file
@@ -203,8 +200,14 @@ class Scheduler:
                         if (not status.output_path or not path.is_absolute()
                                 or not (path.is_file() or path.is_dir())):
                             raise JobFailed(f"Worker {address} returned a missing/invalid output path")
-                        if is_reduce and (path != Path(request.output_path) or not path.is_file()):
-                            raise JobFailed(f"Worker {address} did not write the assigned reduce output")
+                        if is_reduce:
+                            expected = Path(request.output_path) / (
+                                f"reduce_{request.task_id}_attempt_{request.attempt_id}.jsonl"
+                            )
+                            if path != expected or not path.is_file():
+                                raise JobFailed(f"Worker {address} did not write the assigned reduce output")
+                        elif not path.is_dir():
+                            raise JobFailed(f"Worker {address} map output must be a partition directory")
                         outputs[request.task_id] = str(path)
                         self.store.task_completed(job_id, request.task_id, is_reduce)
                     elif status.state not in (worker_pb2.PENDING, worker_pb2.RUNNING):

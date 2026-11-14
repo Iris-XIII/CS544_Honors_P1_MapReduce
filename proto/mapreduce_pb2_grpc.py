@@ -26,7 +26,8 @@ if _version_not_supported:
 
 
 class WorkerServiceStub:
-    """Missing associated documentation comment in .proto file."""
+    """Worker-side RPCs called by the boss.
+    """
 
     def __init__(self, channel):
         """Constructor.
@@ -52,22 +53,26 @@ class WorkerServiceStub:
 
 
 class WorkerServiceServicer:
-    """Missing associated documentation comment in .proto file."""
+    """Worker-side RPCs called by the boss.
+    """
 
     def RunMap(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Assign a map task to a worker.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def RunReduce(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Assign a reduce task to a worker.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetTaskStatus(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Query the current status of a task attempt.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -99,7 +104,8 @@ def add_WorkerServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class WorkerService:
-    """Missing associated documentation comment in .proto file."""
+    """Worker-side RPCs called by the boss.
+    """
 
     @staticmethod
     def RunMap(request,

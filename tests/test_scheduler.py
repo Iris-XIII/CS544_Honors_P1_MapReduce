@@ -39,6 +39,7 @@ class ControlledWorker(worker_grpc.WorkerServiceServicer):
         self.fail_reduce = None
         self.unknown = False
         self.missing_output = False
+        self.missing_partition = False
         self.wrong_reduce_output = False
         self.rpc_error = False
 
@@ -82,17 +83,26 @@ class ControlledWorker(worker_grpc.WorkerServiceServicer):
             if self.fail_reduce is not None and is_reduce == self.fail_reduce:
                 return worker_pb2.TaskStatusReply(state=worker_pb2.FAILED, error="Deliberate task failure")
             if is_reduce:
-                path = Path(task.output_path)
+                path = Path(task.output_path) / f"reduce_{task.task_id}_attempt_{task.attempt_id}.jsonl"
                 if self.wrong_reduce_output:
                     path = path.with_name("unexpected.jsonl")
-                manifest = json.loads(Path(task.intermediate_path).read_text())
-                if manifest["job_id"] != task.job_id:
-                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Wrong manifest job")
+                if task.intermediate_path or not task.input_paths:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Expected explicit partition files")
+                if not all(Path(p).is_file() for p in task.input_paths):
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Missing input partition")
             else:
-                path = self.root / task.job_id / f"map-{task.task_id}-attempt-{task.attempt_id}.jsonl"
+                path = self.root / task.job_id / f"map_{task.task_id}_attempt_{task.attempt_id}"
             if not self.missing_output:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps({"task_id": task.task_id}) + "\n")
+                if is_reduce:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps({"task_id": task.task_id}) + "\n")
+                else:
+                    path.mkdir(parents=True, exist_ok=True)
+                    for reducer_id in range(task.num_reducers):
+                        if self.missing_partition and reducer_id == 0:
+                            continue
+                        partition = path / f"map_{task.task_id}_attempt_{task.attempt_id}_reduce_{reducer_id}.jsonl"
+                        partition.write_text(json.dumps({"task_id": task.task_id}) + "\n")
             self._event("complete", task, is_reduce)
             return worker_pb2.TaskStatusReply(state=worker_pb2.COMPLETED, output_path=str(path))
 
@@ -159,7 +169,7 @@ class TestScheduler(unittest.TestCase):
             return status if status.state in (boss_pb2.JOB_COMPLETED, boss_pb2.JOB_FAILED) else None
         return self.wait_for(terminal)
 
-    def test_dispatch_barrier_manifest_and_final_output(self):
+    def test_dispatch_barrier_partition_selection_and_final_output(self):
         job_id = self.submit(maps=5, reduces=3)
         self.scheduler.start()
         result = self.finished(job_id)
@@ -175,10 +185,16 @@ class TestScheduler(unittest.TestCase):
         first_reduce = next(i for i, event in enumerate(self.events) if event[0] == "start" and event[2])
         completed_before_reduce = [e for e in self.events[:first_reduce] if e[0] == "complete" and not e[2]]
         self.assertEqual(len(completed_before_reduce), 5)
-        manifest = json.loads((self.root / "intermediate" / job_id / "map-outputs.json").read_text())
-        self.assertEqual(manifest["num_reducers"], 3)
-        self.assertEqual([r["task_id"] for r in manifest["map_outputs"]], list(range(5)))
-        self.assertTrue(all(Path(r["output_path"]).is_file() for r in manifest["map_outputs"]))
+        reduces = [request for request, is_reduce in calls if is_reduce]
+        for request in reduces:
+            self.assertFalse(request.intermediate_path)
+            self.assertEqual(len(request.input_paths), 5)
+            self.assertEqual(
+                [Path(path).name for path in request.input_paths],
+                [f"map_{i}_attempt_0_reduce_{request.task_id}.jsonl" for i in range(5)],
+            )
+            self.assertTrue(all(Path(path).is_file() for path in request.input_paths))
+            self.assertEqual(request.output_path, str(self.root / "intermediate" / job_id / "reduce"))
         parts = sorted((self.root / "output").iterdir())
         self.assertEqual([p.name for p in parts], [f"part-{i:05d}.jsonl" for i in range(3)])
         self.assertEqual([json.loads(p.read_text())["task_id"] for p in parts], [0, 1, 2])
@@ -274,6 +290,15 @@ class TestScheduler(unittest.TestCase):
         job_id = self.submit()
         self.scheduler.start()
         self.assertIn("output path", self.finished(job_id).error)
+
+    def test_missing_partition_fails_before_any_reducer_starts(self):
+        self.workers[0].missing_partition = True
+        job_id = self.submit()
+        self.scheduler.start()
+        result = self.finished(job_id)
+        self.assertEqual(result.state, boss_pb2.JOB_FAILED)
+        self.assertIn("missing reducer 0 partition", result.error)
+        self.assertFalse(any(event[2] for event in self.events))
 
     def test_existing_output_is_preserved(self):
         output = self.root / "output"
