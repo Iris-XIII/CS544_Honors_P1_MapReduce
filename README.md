@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory() as directory:
         "    for word in value.split():\n"
         "        yield word, 1\n\n"
         "def reduce(key, values):\n"
-        "    yield key, sum(values)\n"
+        "    return key, sum(values)\n"
     )
     with grpc.insecure_channel("localhost:50050") as channel:
         stub = boss_pb2_grpc.BossServiceStub(channel)
@@ -145,7 +145,7 @@ script, not a unittest case. Run it separately with a fresh Worker server:
 
 ```bash
 # Terminal 1 (environment and PYTHONPATH set as above)
-python worker/worker.py
+python -m worker.worker
 # Terminal 2 (same setup)
 python tests/test_worker_rpc.py
 ```
