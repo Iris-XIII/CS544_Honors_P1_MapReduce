@@ -5,10 +5,16 @@ for the system design and planned speculative execution feature.
 
 ## Current scope
 
-The Boss accepts jobs and reports their registration status. Jobs stay
-`JOB_QUEUED`: scheduling, Worker execution integration, the client CLI, and Docker
-Compose deployment are subsequent work. This is not yet an end-to-end MapReduce
-runner. Job records live only in memory and are lost when the Boss restarts.
+The Boss supports job registration, status tracking, and baseline push scheduling.
+With configured Workers, it runs one job at a time, dispatches maps, waits for all
+maps, then dispatches reducers and publishes their outputs. Without configured
+Workers, it runs in API-only mode and jobs stay `JOB_QUEUED`.
+
+The checked-in Worker RPC server is still an acceptance/status skeleton. A
+standalone mapper exists, but it is not connected to the RPC handlers. Scheduler
+tests use controlled Worker servers. Real map/shuffle/reduce integration, the
+client CLI, speculative execution, and Docker Compose deployment remain to be
+implemented. Job records live only in memory and are lost when the Boss restarts.
 
 ## Setup
 
@@ -46,8 +52,26 @@ python -m boss.server --address 127.0.0.1:50050
 The default address is `[::]:50050`; the existing Worker uses port `50051`.
 Stop with Ctrl+C. These development servers use insecure gRPC.
 
+To enable scheduling, supply Worker addresses and a workspace visible at the same
+absolute path to the Boss and every Worker:
+
+```bash
+python -m boss.server \
+  --workers worker1:50051 worker2:50051 worker3:50051 worker4:50051 \
+  --work-dir /shared/intermediate \
+  --poll-interval 0.2 --rpc-timeout 3 --task-timeout 300
+```
+
+Those hostnames are illustrative container addresses; Docker Compose is not set
+up yet. With local Workers use their actual host/port addresses. Each address must
+identify a different Worker. The current skeleton will remain pending until the
+task timeout fails the job. Worker execution must implement the proposed
+[scheduler/Worker contract](docs/scheduler-worker-contract.md) before real jobs
+can complete.
+
 ## Try submission and status lookup
 
+Start the Boss **without `--workers`** for this registration-only example.
 In another terminal, activate the environment and set `PYTHONPATH` as above.
 This example creates temporary local files standing in for shared storage. It
 registers a word-count job and queries its status; it does not execute the job.
@@ -68,7 +92,7 @@ with tempfile.TemporaryDirectory() as directory:
         "    for word in value.split():\n"
         "        yield word, 1\n\n"
         "def reduce(key, values):\n"
-        "    yield key, sum(values)\n"
+        "    return key, sum(values)\n"
     )
     with grpc.insecure_channel("localhost:50050") as channel:
         stub = boss_pb2_grpc.BossServiceStub(channel)
@@ -101,7 +125,8 @@ the temporary example above is only for registration testing.
   the Boss runs in Docker. Input and job files must exist and be readable.
 - Output may be an existing directory or a directory to create later; it cannot
   be a file or have a file as a parent. Submission does not write to it or check
-  future write permissions. Use a distinct output directory for each real job.
+  future write permissions. When scheduling starts, output must be empty and must
+  not overlap the job workspace. Use a distinct output directory for each job.
 - Submission does not execute user code or verify that its map/reduce functions
   are valid. Execution errors will be handled by the Worker/scheduler later.
 - Invalid submissions and empty status-query IDs return gRPC `INVALID_ARGUMENT`.
@@ -109,8 +134,8 @@ the temporary example above is only for registration testing.
 - Each successful submission creates a new job, even if the settings are
   identical. Submission retries are not deduplicated.
 - Job states are `JOB_QUEUED`, `JOB_RUNNING`, `JOB_COMPLETED`, and `JOB_FAILED`.
-  Only `JOB_QUEUED` is currently produced. `JOB_UNKNOWN` is the protobuf default;
-  missing jobs produce `NOT_FOUND` instead.
+  A configured scheduler advances these states; API-only mode keeps jobs queued.
+  `JOB_UNKNOWN` is the protobuf default; missing jobs produce `NOT_FOUND` instead.
 
 ## How the implementation fits together
 
@@ -128,10 +153,43 @@ the temporary example above is only for registration testing.
    a free local port and make RPC calls. They cover submission, polling, invalid
    inputs, unknown IDs, no user-code execution during registration, immutable
    records, and simultaneous submissions.
-5. **Next PR: scheduling.** Add a task queue, assign tasks to idle Workers, poll
-   attempts, and update job records under the store's lock. Start reduces only
-   after all logical map tasks succeed. Count logical tasks rather than attempts
-   so future speculative execution does not inflate progress.
+5. **`boss/scheduler.py`: scheduling.** One background thread claims jobs from a
+   FIFO queue. Each phase has its own task queue and tracks at most one active task
+   per Worker. It polls statuses, records completions, and starts reduces only
+   after all logical maps succeed. Progress counts each logical task once.
+6. **`tests/test_scheduler.py`: scheduling checks.** Controlled gRPC Workers test
+   task distribution, line ranges, the map/reduce barrier, FIFO job order, output
+   manifests, progress, final publication, failures, timeouts, and shutdown. They
+   do not test the real Worker execution algorithms.
+
+## Baseline scheduler behavior
+
+- Jobs execute in registration order, one job at a time. Tasks within a phase run
+  concurrently across Workers. Every task uses `attempt_id=0`.
+- The Boss counts UTF-8 text lines and assigns balanced `[start_line, end_line)`
+  ranges. Empty input or fewer lines than maps still produces the requested number
+  of map tasks, including empty ranges. Input files must stay unchanged throughout
+  the job. Multiline CSV records are not supported by this line-based partitioning.
+- After all maps complete, the Boss writes a manifest containing one successful
+  output path per map. Reducers receive that manifest through `intermediate_path`.
+- Reducers write separate attempt files in the job workspace. After all succeed,
+  the Boss copies results into `output_path/part-00000.jsonl`, etc., using an atomic
+  rename per file. Only `JOB_COMPLETED` means the complete result is available.
+  A filesystem error during publication can leave partial files; the job fails
+  and those files must not be treated as a complete result.
+- Rejection, unknown attempts, failed tasks, missing outputs, RPC errors, or task
+  timeouts fail the job. No retries or speculative attempts are launched.
+- `--rpc-timeout` limits each RPC. `--task-timeout` measures wall-clock time since
+  dispatch, including time pending on the Worker; it does not trust Worker timing.
+- On job failure, Workers still running or with uncertain task status are disabled
+  for the rest of this Boss process. There is no cancellation RPC, so immediately
+  reusing them could overlap tasks. Workers confirmed terminal can run later jobs.
+  If none remain usable, later jobs fail with a clear error. To reset, stop/restart
+  affected Workers before restarting the Boss. Workspaces are retained for review;
+  the scheduler does not delete them automatically.
+- Ctrl+C stops the Boss and scheduler. The active job is marked failed in memory;
+  remote tasks cannot be cancelled through the current protocol. Restart loses
+  all job records, including queued jobs.
 
 ## Tests
 
@@ -145,7 +203,7 @@ script, not a unittest case. Run it separately with a fresh Worker server:
 
 ```bash
 # Terminal 1 (environment and PYTHONPATH set as above)
-python worker/worker.py
+python -m worker.worker
 # Terminal 2 (same setup)
 python tests/test_worker_rpc.py
 ```
