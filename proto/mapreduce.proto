@@ -44,6 +44,9 @@ message ReduceTaskRequest {
     string intermediate_path = 4; // Location of intermediate map output
     string output_path = 5;       // Destination for this attempt's reduce output
     string job_file = 6;          // File containing user-defined reduce function
+
+    // Selected intermediate files from winning map attempts.
+    repeated string input_paths = 7;
 }
 
 // Response indicating whether the worker accepted a task.
