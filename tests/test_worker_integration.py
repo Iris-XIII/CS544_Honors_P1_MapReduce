@@ -3,24 +3,24 @@ import json
 import time
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
-import grpc
 import mapreduce_pb2 as pb2
-import mapreduce_pb2_grpc as pb2_grpc
+from worker_test_utils import running_worker
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def wait_for_completion(stub, job_id, task_id, is_reduce):
+def wait_for_completion(stub, job_id, task_id, is_reduce, attempt_id=0):
     """Poll the Worker until a task completes or fails."""
     for _ in range(50):
         status = stub.GetTaskStatus(
             pb2.TaskStatusRequest(
                 job_id=job_id,
                 task_id=task_id,
-                attempt_id=0,
+                attempt_id=attempt_id,
                 is_reduce=is_reduce,
             ),
             timeout=5,
@@ -41,164 +41,226 @@ def wait_for_completion(stub, job_id, task_id, is_reduce):
 
 class TestWorkerIntegration(unittest.TestCase):
 
+    def setUp(self):
+        """Create temporary storage and start an isolated Worker server."""
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+        self.shared_root = Path(self.temp_dir.name)
+
+        worker_context = running_worker(self.shared_root)
+        self.stub = worker_context.__enter__()
+
+        # Shut down the Worker before deleting temporary storage.
+        self.addCleanup(
+            lambda: worker_context.__exit__(None, None, None)
+        )
+
     def test_map_reduce_over_grpc(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp = Path(temp_dir)
+        """Verify the complete map -> shuffle -> reduce pipeline."""
 
-            input_path = ROOT / "examples/data/input.txt"
-            job_file = ROOT / "examples/wordcount.py"
+        stub = self.stub
+        job_id = f"integration_{uuid.uuid4().hex}"
 
-            channel = grpc.insecure_channel("localhost:50051")
-            grpc.channel_ready_future(channel).result(timeout=5)
-            stub = pb2_grpc.WorkerServiceStub(channel)
+        input_path = ROOT / "examples/data/input.txt"
+        job_file = ROOT / "examples/wordcount.py"
 
-            # Submit two map tasks with non-overlapping line ranges.
-            for task_id, (start, end) in enumerate([(0, 2), (2, 4)]):
-                reply = stub.RunMap(
-                    pb2.MapTaskRequest(
-                        job_id="integration_test",
-                        task_id=task_id,
-                        attempt_id=0,
-                        input_path=str(input_path),
-                        job_file=str(job_file),
-                        num_reducers=2,
-                        start_line=start,
-                        end_line=end,
-                    ),
-                    timeout=5,
-                )
-                self.assertTrue(reply.accepted)
+        output_dir = self.shared_root / "output"
 
-            map_outputs = []
+        # --------------------------------------------------
+        # Step 1: Submit two map tasks.
+        # --------------------------------------------------
 
-            for task_id in range(2):
-                status = wait_for_completion(
-                    stub, "integration_test", task_id, False
-                )
-                map_outputs.append(Path(status.output_path))
-
-            # Submit reduce tasks using each map's partition files.
-            for reducer_id in range(2):
-                input_paths = [
-                    str(
-                        path /
-                        f"map_{map_id}_attempt_0_reduce_{reducer_id}.jsonl"
-                    )
-                    for map_id, path in enumerate(map_outputs)
-                ]
-
-                reply = stub.RunReduce(
-                    pb2.ReduceTaskRequest(
-                        job_id="integration_test",
-                        task_id=reducer_id,
-                        attempt_id=0,
-                        job_file=str(job_file),
-                        output_path=str(temp / "output"),
-                        input_paths=input_paths,
-                    ),
-                    timeout=5,
-                )
-                self.assertTrue(reply.accepted)
-
-            results = {}
-
-            for reducer_id in range(2):
-                status = wait_for_completion(
-                    stub, "integration_test", reducer_id, True
-                )
-
-                with open(status.output_path, encoding="utf-8") as f:
-                    for line in f:
-                        record = json.loads(line)
-                        results[record["key"]] = record["value"]
-
-            self.assertEqual(
-                results,
-                {
-                    "hello": 2,
-                    "world": 3,
-                    "mapreduce": 1,
-                    "distributed": 1,
-                    "computing": 1,
-                },
+        for task_id, (start, end) in enumerate([(0, 2), (2, 4)]):
+            reply = stub.RunMap(
+                pb2.MapTaskRequest(
+                    job_id=job_id,
+                    task_id=task_id,
+                    attempt_id=0,
+                    input_path=str(input_path),
+                    job_file=str(job_file),
+                    num_reducers=2,
+                    start_line=start,
+                    end_line=end,
+                ),
+                timeout=5,
             )
 
-            channel.close()
+            self.assertTrue(reply.accepted)
 
+        # --------------------------------------------------
+        # Step 2: Wait for map tasks to complete.
+        # --------------------------------------------------
+
+        map_outputs = []
+
+        for task_id in range(2):
+            status = wait_for_completion(
+                stub,
+                job_id,
+                task_id,
+                is_reduce=False,
+            )
+
+            output_path = Path(status.output_path)
+            self.assertTrue(output_path.is_dir())
+
+            map_outputs.append(output_path)
+
+        # --------------------------------------------------
+        # Step 3: Submit two reduce tasks.
+        # --------------------------------------------------
+
+        for reducer_id in range(2):
+            input_paths = [
+                str(
+                    path /
+                    f"map_{map_id}_attempt_0_reduce_{reducer_id}.jsonl"
+                )
+                for map_id, path in enumerate(map_outputs)
+            ]
+
+            # Verify that the map partition files exist.
+            for input_file in input_paths:
+                self.assertTrue(Path(input_file).is_file())
+
+            reply = stub.RunReduce(
+                pb2.ReduceTaskRequest(
+                    job_id=job_id,
+                    task_id=reducer_id,
+                    attempt_id=0,
+                    job_file=str(job_file),
+                    output_path=str(output_dir),
+                    input_paths=input_paths,
+                ),
+                timeout=5,
+            )
+
+            self.assertTrue(reply.accepted)
+
+        # --------------------------------------------------
+        # Step 4: Wait for reduce tasks and collect results.
+        # --------------------------------------------------
+
+        results = {}
+
+        for reducer_id in range(2):
+            status = wait_for_completion(
+                stub,
+                job_id,
+                reducer_id,
+                is_reduce=True,
+            )
+
+            result_path = Path(status.output_path)
+            self.assertTrue(result_path.is_file())
+
+            with result_path.open(encoding="utf-8") as f:
+                for line in f:
+                    record = json.loads(line)
+                    results[record["key"]] = record["value"]
+
+        # --------------------------------------------------
+        # Step 5: Verify final word counts.
+        # --------------------------------------------------
+
+        self.assertEqual(
+            results,
+            {
+                "hello": 2,
+                "world": 3,
+                "mapreduce": 1,
+                "distributed": 1,
+                "computing": 1,
+            },
+        )
 
     def test_map_attempt_isolation(self):
         """Different attempts must not overwrite each other's output."""
 
-        import uuid
-
+        stub = self.stub
         job_id = f"isolation_{uuid.uuid4().hex}"
 
         input_path = ROOT / "examples/data/input.txt"
         job_file = ROOT / "examples/wordcount.py"
 
-        with grpc.insecure_channel("localhost:50051") as channel:
-            stub = pb2_grpc.WorkerServiceStub(channel)
+        output_paths = []
 
-            output_paths = []
+        # --------------------------------------------------
+        # Step 1: Submit two attempts of the same map task.
+        # --------------------------------------------------
 
-            for attempt_id in [0, 1]:
-                response = stub.RunMap(
-                    pb2.MapTaskRequest(
-                        job_id=job_id,
-                        task_id=0,
-                        attempt_id=attempt_id,
-                        input_path=str(input_path),
-                        job_file=str(job_file),
-                        num_reducers=2,
-                        start_line=0,
-                        end_line=2,
-                    ),
-                    timeout=5,
+        for attempt_id in (0, 1):
+            reply = stub.RunMap(
+                pb2.MapTaskRequest(
+                    job_id=job_id,
+                    task_id=0,
+                    attempt_id=attempt_id,
+                    input_path=str(input_path),
+                    job_file=str(job_file),
+                    num_reducers=2,
+                    start_line=0,
+                    end_line=2,
+                ),
+                timeout=5,
+            )
+
+            self.assertTrue(reply.accepted)
+
+        # --------------------------------------------------
+        # Step 2: Wait for both attempts to complete.
+        # --------------------------------------------------
+
+        for attempt_id in (0, 1):
+            status = wait_for_completion(
+                stub,
+                job_id,
+                task_id=0,
+                is_reduce=False,
+                attempt_id=attempt_id,
+            )
+
+            output_path = Path(status.output_path)
+            self.assertTrue(output_path.is_dir())
+
+            output_paths.append(output_path)
+
+        # --------------------------------------------------
+        # Step 3: Verify separate output directories.
+        # --------------------------------------------------
+
+        self.assertEqual(len(output_paths), 2)
+        self.assertNotEqual(output_paths[0], output_paths[1])
+
+        # Both directories must belong to the temporary storage.
+        for output_path in output_paths:
+            self.assertTrue(
+                output_path.is_relative_to(self.shared_root)
+            )
+
+        # --------------------------------------------------
+        # Step 4: Verify each attempt's partition files.
+        # --------------------------------------------------
+
+        for attempt_id, output_dir in enumerate(output_paths):
+            for reducer_id in range(2):
+                partition = output_dir / (
+                    f"map_0_attempt_{attempt_id}_"
+                    f"reduce_{reducer_id}.jsonl"
                 )
 
-                self.assertTrue(response.accepted)
+                self.assertTrue(
+                    partition.is_file(),
+                    f"Missing partition: {partition}",
+                )
 
-            for attempt_id in [0, 1]:
-                # Query the status of this specific attempt.
-                for _ in range(50):
-                    status = stub.GetTaskStatus(
-                        pb2.TaskStatusRequest(
-                            job_id=job_id,
-                            task_id=0,
-                            attempt_id=attempt_id,
-                            is_reduce=False,
-                        ),
-                        timeout=5,
-                    )
-
-                    if status.state == pb2.COMPLETED:
-                        break
-
-                    if status.state == pb2.FAILED:
-                        self.fail(status.error)
-
-                    time.sleep(0.1)
-                else:
-                    self.fail("Attempt did not complete")
-
-                output_paths.append(Path(status.output_path))
-
-            # Both attempts should have separate output directories.
-            self.assertNotEqual(output_paths[0], output_paths[1])
-
-            # Both directories must exist.
-            self.assertTrue(output_paths[0].is_dir())
-            self.assertTrue(output_paths[1].is_dir())
-
-            # Both attempts should produce valid intermediate files.
-            for attempt_id, output_dir in enumerate(output_paths):
-                for reducer_id in range(2):
-                    partition = output_dir / (
-                        f"map_0_attempt_{attempt_id}_"
-                        f"reduce_{reducer_id}.jsonl"
-                    )
-                    self.assertTrue(partition.exists())
-
+                # Verify that each line is valid JSONL.
+                with partition.open(encoding="utf-8") as f:
+                    for line in f:
+                        record = json.loads(line)
+                        self.assertIn("key", record)
+                        self.assertIn("value", record)
 
 
 if __name__ == "__main__":
