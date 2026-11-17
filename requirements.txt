@@ -1,0 +1,4 @@
+# Match the versions used to generate the checked-in protobuf/gRPC modules.
+grpcio==1.85.1
+grpcio-tools==1.85.1
+protobuf==7.35.1

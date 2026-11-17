@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package mapreduce;
+
+// Client-side job submission and monitoring. Task dispatch uses WorkerService.
+service BossService {
+    rpc SubmitJob(SubmitJobRequest) returns (SubmitJobReply);
+    rpc GetJobStatus(JobStatusRequest) returns (JobStatusReply);
+}
+
+// Prefixes avoid collisions with the Worker TaskState enum in this package.
+enum JobState {
+    JOB_UNKNOWN = 0;
+    JOB_QUEUED = 1;
+    JOB_RUNNING = 2;
+    JOB_COMPLETED = 3;
+    JOB_FAILED = 4;
+}
+
+message SubmitJobRequest {
+    // Absolute paths as seen by the Boss and Workers in shared storage.
+    string input_path = 1;  // One input file; records will be split into map tasks.
+    string output_path = 2; // Output directory, which need not exist yet.
+    string job_file = 3;    // Python file defining the user's map/reduce functions.
+    int32 num_maps = 4;     // Must be positive.
+    int32 num_reducers = 5; // Must be positive.
+}
+
+// A successful RPC means the job was registered, not that it has executed.
+// Each submission creates a new job, including repeated identical requests.
+message SubmitJobReply {
+    string job_id = 1;
+    JobState state = 2;
+}
+
+message JobStatusRequest {
+    string job_id = 1;
+}
+
+message JobStatusReply {
+    string job_id = 1;
+    JobState state = 2;
+    int32 num_maps = 3;
+    int32 num_reducers = 4;
+    // Count completed logical tasks, not speculative attempts.
+    int32 completed_maps = 5;
+    int32 completed_reducers = 6;
+    string output_path = 7; // Requested destination; valid results require JOB_COMPLETED.
+    string error = 8;       // Failure details when state is JOB_FAILED.
+    double submitted_at_unix_seconds = 9;
+}
