@@ -1,6 +1,8 @@
 """Run with PYTHONPATH=proto python -m boss.server from the repository root."""
 
 import argparse
+import logging
+import os
 from concurrent import futures
 from pathlib import Path
 
@@ -112,7 +114,14 @@ def main():
     parser.add_argument("--poll-interval", type=float, default=0.2)
     parser.add_argument("--rpc-timeout", type=float, default=3.0)
     parser.add_argument("--task-timeout", type=float, default=300.0)
+    parser.add_argument("--speculate", action="store_true",
+                        default=os.environ.get("BOSS_SPECULATE", "0") == "1",
+                        help="Enable map straggler detection and speculative duplicates")
+    parser.add_argument("--straggler-seconds", type=float,
+                        default=float(os.environ.get("BOSS_STRAGGLER_SECONDS", "1.0")),
+                        help="Minimum map runtime before considering speculation")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     store = JobStore()
     scheduler = None
     if args.workers:
@@ -120,6 +129,7 @@ def main():
             scheduler = Scheduler(
                 store, args.workers, args.work_dir, args.poll_interval,
                 args.rpc_timeout, args.task_timeout,
+                speculate=args.speculate, straggler_seconds=args.straggler_seconds,
             )
         except ValueError as exc:
             parser.error(str(exc))

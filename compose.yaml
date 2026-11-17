@@ -50,6 +50,9 @@ services:
       - worker4:50051
       - --work-dir
       - /shared/intermediate
+    environment:
+      BOSS_SPECULATE: "${BOSS_SPECULATE:-0}"
+      BOSS_STRAGGLER_SECONDS: "${BOSS_STRAGGLER_SECONDS:-1.0}"
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     volumes:
       - ./shared:/shared
