@@ -187,6 +187,7 @@ class WorkerService(pb2_grpc.WorkerServiceServicer):
                 flush=True,
             )
 
+
     def _execute_map(self, request):
         """Execute map() and partition intermediate output."""
 
@@ -200,6 +201,31 @@ class WorkerService(pb2_grpc.WorkerServiceServicer):
             f"map_{request.task_id}_"
             f"attempt_{request.attempt_id}_raw.jsonl"
         )
+
+
+
+        # Optional artificial delay for straggler simulation.
+        # Disabled by default, so normal Worker behavior is unchanged.
+        delay_seconds = float(os.environ.get("MAP_DELAY_SECONDS", "0"))
+        delay_task_id = int(os.environ.get("MAP_DELAY_TASK_ID", "0"))
+        delay_attempt_id = int(os.environ.get("MAP_DELAY_ATTEMPT_ID", "0"))
+
+        if (
+            delay_seconds > 0
+            and request.task_id == delay_task_id
+            and request.attempt_id == delay_attempt_id
+        ):
+            print(
+                f"[Worker] Simulating straggler: "
+                f"MAP task {request.task_id}, "
+                f"attempt {request.attempt_id}, "
+                f"sleeping {delay_seconds}s",
+                flush=True,
+            )
+            time.sleep(delay_seconds)
+
+
+
 
         execute_map(
             input_path=request.input_path,
