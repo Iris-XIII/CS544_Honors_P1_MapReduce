@@ -1,0 +1,73 @@
+# Development/demo deployment on one VM. Run `mkdir -p shared/{input,jobs,intermediate,output}` first.
+# Pass LOCAL_UID/LOCAL_GID if your VM account does not use UID/GID 1000.
+name: cs544-mapreduce
+
+x-worker-base: &worker-base
+  build: .
+  image: cs544-mapreduce:local
+  command: ["python", "-m", "worker.worker"]
+  environment:
+    SHARED_ROOT: /shared
+    WORKER_PORT: "50051"
+  volumes:
+    - ./shared:/shared
+  user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+  cpus: 1.0
+  init: true
+  healthcheck:
+    test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 50051), 2).close()"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+    start_period: 10s
+
+services:
+  worker1:
+    <<: *worker-base
+
+  worker2:
+    <<: *worker-base
+
+  worker3:
+    <<: *worker-base
+
+  worker4:
+    <<: *worker-base
+
+  boss:
+    build: .
+    image: cs544-mapreduce:local
+    command:
+      - python
+      - -m
+      - boss.server
+      - --address
+      - 0.0.0.0:50050
+      - --workers
+      - worker1:50051
+      - worker2:50051
+      - worker3:50051
+      - worker4:50051
+      - --work-dir
+      - /shared/intermediate
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    volumes:
+      - ./shared:/shared
+    ports:
+      - "127.0.0.1:50050:50050"
+    init: true
+    depends_on:
+      worker1:
+        condition: service_healthy
+      worker2:
+        condition: service_healthy
+      worker3:
+        condition: service_healthy
+      worker4:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 50050), 2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
