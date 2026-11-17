@@ -1,297 +1,251 @@
-# CS544 Honors MapReduce
+# CS 544 Honors Project 1: MapReduce
 
-A Python/gRPC MapReduce implementation in progress. See [design.md](design.md)
-for the system design and planned speculative execution feature.
+A Python MapReduce framework that runs on a single VM using **gRPC**, **Protocol Buffers**, and **Docker Compose**. A command-line client submits jobs to a Boss, which schedules map and reduce tasks across four Worker containers. The optional special feature is **straggler detection with speculative map execution**.
 
-## Current scope
+See [design.md](design.md) for the original design and [docs/speculative-execution.md](docs/speculative-execution.md) for the detection and scheduling details.
 
-The Boss supports job registration, status tracking, and baseline push scheduling.
-With configured Workers, it runs one job at a time, dispatches maps, waits for all
-maps, then dispatches reducers and publishes their outputs. Without configured
-Workers, it runs in API-only mode and jobs stay `JOB_QUEUED`.
+## Features
 
-The Worker executes map/shuffle/reduce tasks asynchronously through gRPC. The
-scheduler supplies explicit reducer input files and publishes completed outputs.
-The client CLI submits jobs and monitors progress from outside the containers.
-Self-contained tests exercise the full Client/Boss/Worker pipeline. Speculative
-execution and Docker Compose deployment remain to be implemented.
-Job records live only in memory and are lost when the Boss restarts.
+- **Client CLI:** submit jobs, follow progress, or look up an existing job ID.
+- **Boss:** track job state; distribute map tasks; wait for the map phase before reducing; select shuffle inputs; and publish final output.
+- **Workers:** run user-defined Python `map()` and `reduce()` functions and report task status through gRPC.
+- **Shuffle:** write JSONL key/value records, partition keys deterministically with SHA-256, and send each reducer the selected partition files.
+- **Shared storage:** a bind-mounted directory accessible to the Boss and Workers.
+- **Speculative execution (optional):** detect a slow map task, launch one duplicate on an idle Worker, and use the first successful attempt's output.
 
-## Setup
+```text
+Client CLI (VM host)
+       |
+       | gRPC: SubmitJob / GetJobStatus
+       v
+      Boss
+       |
+       | gRPC: RunMap / RunReduce / GetTaskStatus
+       v
+  Worker 1   Worker 2   Worker 3   Worker 4
+       \         |         |         /
+        \--------+---------+--------/
+                   |
+          Shared /shared volume
+        input / jobs / intermediate / output
+```
 
-Run commands from the repository root using Python 3.12:
+## Requirements
+
+- One Linux VM with **Docker Engine** and the **Docker Compose plugin**.
+- **Python 3.12** and `venv` for the client running on the VM host.
+- Docker access for the VM user. Each of the four Worker containers is limited to **one CPU** (`cpus: 1.0`); the Boss runs as a separate container.
+
+Run the following commands from the repository root. The Docker image installs its own Python dependencies; the virtual environment below is for the **host-side client and tests**.
+
+## Quick start: WordCount with Docker Compose
+
+**1. Prepare the shared input and user-defined job file.**
+
+```bash
+mkdir -p shared/input shared/jobs shared/intermediate shared/output
+cp examples/data/input.txt shared/input/input.txt
+cp examples/wordcount.py shared/jobs/wordcount.py
+```
+
+**2. Build and start the Boss and four Workers.**
+
+```bash
+LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) docker compose up --build -d
+LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) docker compose ps
+```
+
+Expect one healthy Boss and four healthy Workers. The Boss is reachable on the VM at `localhost:50050`. Worker ports are available inside the Compose network, not exposed on the VM host.
+
+**3. Install dependencies for the client on the VM host.**
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-export PYTHONPATH="$PWD/proto:$PWD"
 ```
 
-On Debian/Ubuntu, creating a virtual environment requires the OS's `python3-venv`
-package. The pinned dependencies match the existing Worker generated code.
-Generated files are committed, so regeneration is only needed after editing a
-`.proto` file:
-
-```bash
-python -m grpc_tools.protoc -Iproto --python_out=proto --grpc_python_out=proto proto/boss.proto
-# Only when changing the Worker protocol:
-python -m grpc_tools.protoc -Iproto --python_out=proto --grpc_python_out=proto proto/mapreduce.proto
-```
-
-The generation command follows the [gRPC Python quick start](https://grpc.io/docs/languages/python/quickstart/).
-Edit the `.proto` source, not the generated `*_pb2.py` or `*_pb2_grpc.py` files.
-
-## Start the Boss
-
-```bash
-python -m boss.server
-# Optional alternate bind address:
-python -m boss.server --address 127.0.0.1:50050
-```
-
-The default address is `[::]:50050`; the existing Worker uses port `50051`.
-Stop with Ctrl+C. These development servers use insecure gRPC.
-
-To enable scheduling, supply Worker addresses and a workspace visible at the same
-absolute path to the Boss and every Worker:
-
-```bash
-python -m boss.server \
-  --workers worker1:50051 worker2:50051 worker3:50051 worker4:50051 \
-  --work-dir /shared/intermediate \
-  --poll-interval 0.2 --rpc-timeout 3 --task-timeout 300
-```
-
-Those hostnames are illustrative container addresses; Docker Compose is not set
-up yet. With local Workers use their actual host/port addresses. Each address must
-identify a different Worker. Start each Worker with `python -m worker.worker`;
-`WORKER_PORT` controls its port and `SHARED_ROOT` controls its shared-storage root
-(defaults: `50051` and `/shared`). The
-[scheduler/Worker contract](docs/scheduler-worker-contract.md) documents the
-interface and shared paths.
-
-## Submit a job with the Client CLI
-
-Run the client on the host, with the virtual environment activated. Its default
-Boss address is `localhost:50050`; use `--boss HOST:PORT` to change it.
+**4. Submit WordCount from the VM host (outside Docker).**
 
 ```bash
 python client.py \
-  --input /shared/input/data.txt \
-  --output /shared/output/wordcount \
+  --boss localhost:50050 \
+  --input /shared/input/input.txt \
+  --output /shared/output/wordcount-1 \
   --job /shared/jobs/wordcount.py \
   --maps 4 --reduces 2
 ```
 
-The five submission arguments are required. Paths must be absolute **as seen by
-the Boss and Workers**. The client forwards them unchanged: it does not upload
-files, resolve local symlinks, or require the same paths to exist on the client.
-Place input and Python job files in shared storage first. Output must be a new
-or empty directory. The client loads its generated modules automatically, so
-`python client.py` does not itself require `PYTHONPATH`.
-
-The client prints the job ID immediately, then reports changes in job state and
-map/reduce completion counts. On success it prints the output directory. It
-waits for `JOB_COMPLETED`, including final file publication, before reporting
-success. Completed task counters alone are not sufficient.
+The client prints a job ID and reports the completed map/reduce counts. Wait until it reports `COMPLETED`, then inspect the output on the VM:
 
 ```bash
-# Submit and return immediately; exit 0 means accepted, not completed.
-python client.py --input /shared/input/data.txt \
-  --output /shared/output/another-job --job /shared/jobs/wordcount.py \
-  --maps 4 --reduces 2 --no-wait
+cat shared/output/wordcount-1/part-*.jsonl
+```
 
-# Replace JOB_ID with the ID printed during submission.
+The expected word counts, across both JSONL output parts, are:
+
+| Word | Count |
+| --- | ---: |
+| `hello` | 2 |
+| `world` | 3 |
+| `mapreduce` | 1 |
+| `distributed` | 1 |
+| `computing` | 1 |
+
+Output record order may vary. **Use a new output directory for each run**: the Boss refuses to overwrite nonempty output directories.
+
+**Important:** The paths passed to `client.py` are absolute paths **inside the containers** (`/shared/...`), even though the client runs on the host. The local files live under `./shared/`; the CLI does not upload them.
+
+### Client options
+
+```bash
+# Submit without waiting for completion:
+python client.py --input /shared/input/input.txt \
+  --output /shared/output/wordcount-2 \
+  --job /shared/jobs/wordcount.py --maps 4 --reduces 2 --no-wait
+
+# Resume monitoring with the ID printed by the client:
 python client.py --status JOB_ID
-# Query just once instead of watching until completion:
+
+# Query status only once:
 python client.py --status JOB_ID --no-wait
 
-# Bound monitoring time without cancelling the server-side job:
+# Stop monitoring after 60 seconds without cancelling the job:
 python client.py --status JOB_ID --wait-timeout 60
 ```
 
-`--status` never submits another job. It cannot be combined with the five
-submission arguments. `--poll-interval` defaults to 1 second, and `--rpc-timeout`
-defaults to 5 seconds per call. `--wait-timeout` limits monitoring after
-submission, with no limit by default; it cannot be combined with `--no-wait`.
-Ctrl+C stops the client but does not cancel the job. You can monitor it later
-using the printed ID. Submission RPCs are not retried automatically, because
-the Boss does not deduplicate submissions.
+Run `python client.py --help` for the complete option list. Job states are `QUEUED`, `RUNNING`, `COMPLETED`, and `FAILED`. Stopping the client does **not** cancel a running job.
 
-| Exit code | Meaning |
-|---|---|
-| `0` | Completed successfully, or submission/status query succeeded with `--no-wait` |
-| `1` | Job failure, RPC error, or invalid server response |
-| `2` | Invalid command-line arguments |
-| `124` | Client monitoring timeout; job was not cancelled |
-| `130` | Client interrupted with Ctrl+C |
+## Special feature: straggler detection and speculative execution
 
-### Local word-count example
+A *straggler* is a task that runs much longer than similar tasks. When `BOSS_SPECULATE=1`, the Boss can launch another **attempt of the same map task** on an idle Worker instead of waiting only for the slow original.
 
-Until Docker Compose is added, run these commands from the repository root in
-three terminals, each with the virtual environment and `PYTHONPATH` configured
-as described above. These paths are host paths because all processes run locally.
+The Boss:
 
-```bash
-# Terminal 1: Worker
-SHARED_ROOT="$PWD/shared" python -m worker.worker
+1. Records map-attempt dispatch times and waits for at least one peer map to finish.
+2. Flags a still-running map when its elapsed runtime reaches **both** the configured minimum (`BOSS_STRAGGLER_SECONDS`, default `1.0`) and **1.5 × the median duration** of completed map tasks.
+3. Runs at most one duplicate (`attempt_id=1`) for an eligible map task, on a different idle Worker. Original pending tasks have priority.
+4. Accepts the **first successful attempt** and passes only that attempt's reducer partitions to the reduce phase. A failed duplicate may fall back to the original.
 
-# Terminal 2: Boss, with scheduling enabled
-python -m boss.server --workers localhost:50051 \
-  --work-dir "$PWD/shared/intermediate"
+Speculation is **off by default** and applies to **map tasks only**. There is no cancellation RPC; a Worker with a still-running losing attempt is kept unavailable until that attempt finishes or is marked unusable.
 
-# Terminal 3: Client (use a different output directory for each run)
-python client.py --input "$PWD/examples/data/input.txt" \
-  --output "$PWD/shared/output/wordcount" \
-  --job "$PWD/examples/wordcount.py" --maps 4 --reduces 2
-```
+### Reproduce a straggler and compare both modes
 
-Expect word counts `hello=2`, `world=3`, `mapreduce=1`, `distributed=1`, and
-`computing=1` across the output partition files. Run `python client.py --help`
-for all options.
+The optional `compose.straggler.yaml` configuration delays **Worker 1, map task 0, attempt 0** by eight seconds. A speculative `attempt_id=1` is not delayed. Use the **regular** `examples/wordcount.py` with this simulation; no special input marker is needed.
 
-## Try the Boss API directly
-
-Start the Boss **without `--workers`** for this registration-only example.
-In another terminal, activate the environment and set `PYTHONPATH` as above.
-This example creates temporary local files standing in for shared storage. It
-registers a word-count job and queries its status; it does not execute the job.
+First, run the baseline **with the delay but without speculation**:
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-import tempfile
-import grpc
-import boss_pb2
-import boss_pb2_grpc
+LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) BOSS_SPECULATE=0 \
+  docker compose -f compose.yaml -f compose.straggler.yaml up --build -d
 
-with tempfile.TemporaryDirectory() as directory:
-    root = Path(directory)
-    (root / "input.txt").write_text("hello world\nhello mapreduce\n")
-    (root / "wordcount.py").write_text(
-        "def map(key, value):\n"
-        "    for word in value.split():\n"
-        "        yield word, 1\n\n"
-        "def reduce(key, values):\n"
-        "    return key, sum(values)\n"
-    )
-    with grpc.insecure_channel("localhost:50050") as channel:
-        stub = boss_pb2_grpc.BossServiceStub(channel)
-        submitted = stub.SubmitJob(boss_pb2.SubmitJobRequest(
-            input_path=str(root / "input.txt"),
-            output_path=str(root / "output"),
-            job_file=str(root / "wordcount.py"),
-            num_maps=4,
-            num_reducers=2,
-        ), timeout=5)
-        status = stub.GetJobStatus(
-            boss_pb2.JobStatusRequest(job_id=submitted.job_id), timeout=5
-        )
-        print(status)
-PY
+python client.py --input /shared/input/input.txt \
+  --output /shared/output/baseline-run \
+  --job /shared/jobs/wordcount.py --maps 4 --reduces 2
 ```
 
-Expect a unique `job_id`, state `JOB_QUEUED`, four maps, and two reducers.
-Completed task counters are zero (protobuf's text display omits zero fields).
-The returned output path is the requested destination, not proof of completed
-results. Keep real job files and input data available until execution finishes;
-the temporary example above is only for registration testing.
+Then enable speculative scheduling and run the **same workload**, using a fresh output directory:
 
-### API contract
+```bash
+LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) BOSS_SPECULATE=1 BOSS_STRAGGLER_SECONDS=1 \
+  docker compose -f compose.yaml -f compose.straggler.yaml up -d --force-recreate boss
 
-- `SubmitJob` takes the five assignment settings: input file, output directory,
-  Python job file, map count, and reducer count. Counts must be positive.
-- Paths must be absolute **as seen by the Boss and Workers**, e.g.
-  `/shared/input/data.txt` inside containers. A host-only path will not work when
-  the Boss runs in Docker. Input and job files must exist and be readable.
-- Output may be an existing directory or a directory to create later; it cannot
-  be a file or have a file as a parent. Submission does not write to it or check
-  future write permissions. When scheduling starts, output must be empty and must
-  not overlap the job workspace. Use a distinct output directory for each job.
-- Submission does not execute user code or verify that its map/reduce functions
-  are valid. Execution errors will be handled by the Worker/scheduler later.
-- Invalid submissions and empty status-query IDs return gRPC `INVALID_ARGUMENT`.
-  An unknown job ID returns `NOT_FOUND`.
-- Each successful submission creates a new job, even if the settings are
-  identical. Submission retries are not deduplicated.
-- Job states are `JOB_QUEUED`, `JOB_RUNNING`, `JOB_COMPLETED`, and `JOB_FAILED`.
-  A configured scheduler advances these states; API-only mode keeps jobs queued.
-  `JOB_UNKNOWN` is the protobuf default; missing jobs produce `NOT_FOUND` instead.
+python client.py --input /shared/input/input.txt \
+  --output /shared/output/speculative-run \
+  --job /shared/jobs/wordcount.py --maps 4 --reduces 2
+```
 
-## How the implementation fits together
+Check for `Straggler detected` and `Accepted map task 0 attempt 1` in the Boss logs:
 
-1. **`proto/boss.proto`: the contract.** Defines the two client-to-Boss RPCs and
-   their messages. It is separate from Iris's Worker protocol to allow independent
-   changes. Job enum values use a `JOB_` prefix to avoid Worker enum name clashes.
-2. **`boss/jobs.py`: the records.** `JobSpec` holds the five submitted settings.
-   `JobRecord` adds the ID, state, counters, timestamp, and error field. `JobStore`
-   protects dictionary access with a lock. Records and their specs are immutable,
-   so callers cannot accidentally modify shared state after a lookup.
-3. **`boss/server.py`: the RPC handlers.** `SubmitJob` validates settings and
-   creates a record. `GetJobStatus` converts a record into a protobuf reply.
-   `create_server` connects the handlers to gRPC; `main` starts the server.
-4. **`tests/test_boss_rpc.py`: the behavior checks.** Tests start a real server on
-   a free local port and make RPC calls. They cover submission, polling, invalid
-   inputs, unknown IDs, no user-code execution during registration, immutable
-   records, and simultaneous submissions.
-5. **`boss/scheduler.py`: scheduling.** One background thread claims jobs from a
-   FIFO queue. Each phase has its own task queue and tracks at most one active task
-   per Worker. It polls statuses, records completions, and starts reduces only
-   after all logical maps succeed. Progress counts each logical task once.
-6. **`tests/test_scheduler.py`: scheduling checks.** Controlled gRPC Workers test
-   task distribution, line ranges, the map/reduce barrier, FIFO job order, output
-   partition selection, progress, publication, failures, timeouts, and shutdown. They
-   do not test the real Worker execution algorithms.
-7. **`tests/test_boss_worker_integration.py`: real execution.** These tests start
-   their own Boss and four Worker servers on available ports.
-   They check word count across task counts, empty input, a second user-defined
-   job, and exclusion of unselected attempt outputs.
-8. **`client.py`: the host-side CLI.** Parses job settings, submits once, and polls
-   the Boss until completion or failure. It also supports monitoring existing jobs.
-9. **`tests/test_client.py`: CLI checks.** Runs the client as a separate process
-   against isolated Boss and Worker servers, including word count, resuming by ID,
-   failures, input validation, monitoring timeout, and interruption handling.
+```bash
+docker compose -f compose.yaml -f compose.straggler.yaml logs boss worker1 worker2 worker3 worker4
+```
 
-## Baseline scheduler behavior
+Verify that both runs produce identical records (regardless of output-part order):
 
-- Jobs execute in registration order, one job at a time. Tasks within a phase run
-  concurrently across Workers. Every task uses `attempt_id=0`.
-- The Boss counts UTF-8 text lines and assigns balanced `[start_line, end_line)`
-  ranges. Empty input or fewer lines than maps still produces the requested number
-  of map tasks, including empty ranges. Input files must stay unchanged throughout
-  the job. Multiline CSV records are not supported by this line-based partitioning.
-- After all maps complete, the Boss selects each reducer's partition file from
-  every successful map attempt. It checks all files exist before dispatching any
-  reducer, then supplies the list through `ReduceTaskRequest.input_paths`.
-  `intermediate_path` is left empty; no manifest needs to be parsed by the Worker.
-- Reducers write separate attempt files in the job workspace. After all succeed,
-  the Boss copies results into `output_path/part-00000.jsonl`, etc., using an atomic
-  rename per file. Only `JOB_COMPLETED` means the complete result is available.
-  A filesystem error during publication can leave partial files; the job fails
-  and those files must not be treated as a complete result.
-- Rejection, unknown attempts, failed tasks, missing outputs, RPC errors, or task
-  timeouts fail the job. No retries or speculative attempts are launched.
-- `--rpc-timeout` limits each RPC. `--task-timeout` measures wall-clock time since
-  dispatch, including time pending on the Worker; it does not trust Worker timing.
-- On job failure, Workers still running or with uncertain task status are disabled
-  for the rest of this Boss process. There is no cancellation RPC, so immediately
-  reusing them could overlap tasks. Workers confirmed terminal can run later jobs.
-  If none remain usable, later jobs fail with a clear error. To reset, stop/restart
-  affected Workers before restarting the Boss. Workspaces are retained for review;
-  the scheduler does not delete them automatically.
-- Ctrl+C stops the Boss and scheduler. The active job is marked failed in memory;
-  remote tasks cannot be cancelled through the current protocol. Restart loses
-  all job records, including queued jobs.
+```bash
+diff <(sort shared/output/baseline-run/part-*.jsonl) \
+     <(sort shared/output/speculative-run/part-*.jsonl)
+```
+
+An empty `diff` means the sorted results match. Use the same input and task counts in both modes, and use separate output directories.
+
+### Measured benchmark results
+
+The team ran **three trials per configuration** through the Client → Boss → four-Worker Docker deployment. Each Worker was limited to one CPU. The workload used **4 map tasks and 2 reduce tasks**, with an **8-second artificial delay** on Worker 1 for map task 0, original attempt 0. The speculative duplicate was not artificially delayed.
+
+| Trial | Baseline (s) | Speculative (s) |
+| --- | ---: | ---: |
+| 1 | 8.50 | 1.46 |
+| 2 | 8.39 | 1.46 |
+| 3 | 8.29 | 1.47 |
+| **Median** | **8.39** | **1.46** |
+
+This produced a **5.75× speedup** and an **82.6% reduction in median job completion time** in the controlled straggler scenario. Boss logs confirmed duplicate dispatch, and the end-to-end run completed successfully. These measurements **do not claim the same improvement on all inputs or cluster conditions**.
+
+![Median job completion times for baseline and speculative execution, with individual trials](benchmarks/speculation_performance.png)
+
+The source measurements are in [`benchmarks/results.csv`](benchmarks/results.csv). To regenerate the figure from the recorded data:
+
+```bash
+python -m pip install matplotlib  # plot dependency; not needed to run MapReduce
+python benchmarks/plot_results.py
+```
+
+The script calculates the medians and speedup and saves `benchmarks/speculation_performance.png`.
+
+## User-defined jobs and data formats
+
+Provide a Python file defining:
+
+- `map(key, value)`: receives a **zero-based input line number** and that line's text; yields zero or more `(key, value)` pairs.
+- `reduce(key, values)`: receives a key and its grouped values; returns `(key, reduced_value)` or `None` to omit a result.
+
+See [examples/wordcount.py](examples/wordcount.py) and [examples/slow_wordcount.py](examples/slow_wordcount.py). Input is split by **UTF-8 text lines** into balanced ranges; there is no built-in CSV/JSONL record parser or multiline CSV handling. User functions can parse their own line contents. Mapper intermediate records and reducer results are JSONL, with final files named `part-00000.jsonl`, `part-00001.jsonl`, and so on.
+
+The Boss executes submitted jobs one at a time, but runs tasks within each phase concurrently on Workers. All maps must complete successfully before reducers begin.
 
 ## Tests
 
+After activating the host Python environment, run:
+
 ```bash
-python -m unittest discover -s tests -p 'test_*.py' -v
+PYTHONPATH=proto:. python -m unittest discover -s tests -p 'test_*.py' -v
+
+# Focus on Boss scheduling, including speculative execution:
+PYTHONPATH=proto:. python -m unittest discover -s tests -p 'test_scheduler.py' -v
 ```
 
-The GitHub Actions workflow runs these tests on PRs and checks that generated Boss
-and Worker protobuf files match their sources. All RPC/integration tests manage
-their own servers, available ports, and temporary storage. No separately started
-Worker is needed locally or in CI. The Worker RPC tests are included in unittest
-discovery and handle asynchronous execution states.
+The test suite covers the CLI, Boss RPC validation, Worker execution, shuffle/reduce, scheduler failures, and the real Boss/Worker pipeline. The scheduler tests also cover duplicate selection, baseline mode, fallback after a failed duplicate, and safe handling of losing attempts. Tests manage their own temporary servers and directories; Docker does not need to be running for the Python test suite. GitHub Actions runs the tests on pushes to `main` and pull requests.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `client.py` | Host-side submission and status CLI |
+| `boss/` | Job records, gRPC server, scheduler and speculative execution |
+| `worker/` | Map, shuffle, reduce, and Worker gRPC server |
+| `proto/` | Protocol Buffer definitions and generated Python modules |
+| `compose.yaml` | One Boss + four Workers on a shared Docker network |
+| `compose.straggler.yaml` | Optional attempt-specific delay for straggler experiments |
+| `examples/` | WordCount job files and example inputs |
+| `tests/` | Unit and self-contained gRPC/integration tests |
+| `benchmarks/` | Recorded baseline/speculation runtimes, plotting script, and performance chart |
+| `docs/` | Additional design, deployment, and scheduling notes |
+| `shared/` | Local runtime files (ignored by Git) |
+
+## Limits and cleanup
+
+- The system runs on **one VM**, not across multiple physical hosts.
+- Job records are held **in memory**; restarting the Boss loses job IDs and statuses.
+- There is **no task cancellation RPC** or general automatic retry of failed tasks. Speculation duplicates eligible slow map attempts; it is not a full fault-recovery system.
+- Input and job files must remain available and unchanged until the job finishes. Run only **trusted** user-defined Python code; gRPC is configured without TLS for this course deployment.
+- Intermediate workspaces are retained for debugging. A job is not complete until the Boss reports `COMPLETED`; failures during final publication may leave partial files.
+
+Stop the deployment with:
+
+```bash
+LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) docker compose down
+```
+
+Stopping the containers does **not** delete `./shared/` or the results it contains.
