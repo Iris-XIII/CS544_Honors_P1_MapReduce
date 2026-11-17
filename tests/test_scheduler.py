@@ -37,6 +37,7 @@ class ControlledWorker(worker_grpc.WorkerServiceServicer):
         self.overlaps = 0
         self.reject = False
         self.fail_reduce = None
+        self.fail_attempts = set()
         self.unknown = False
         self.missing_output = False
         self.missing_partition = False
@@ -80,7 +81,8 @@ class ControlledWorker(worker_grpc.WorkerServiceServicer):
             if not self.gate.is_set() or self.polls < 2:
                 return worker_pb2.TaskStatusReply(state=worker_pb2.RUNNING)
             self.current = None
-            if self.fail_reduce is not None and is_reduce == self.fail_reduce:
+            if ((task.task_id, task.attempt_id, is_reduce) in self.fail_attempts
+                    or (self.fail_reduce is not None and is_reduce == self.fail_reduce)):
                 return worker_pb2.TaskStatusReply(state=worker_pb2.FAILED, error="Deliberate task failure")
             if is_reduce:
                 path = Path(task.output_path) / f"reduce_{task.task_id}_attempt_{task.attempt_id}.jsonl"
@@ -198,6 +200,79 @@ class TestScheduler(unittest.TestCase):
         parts = sorted((self.root / "output").iterdir())
         self.assertEqual([p.name for p in parts], [f"part-{i:05d}.jsonl" for i in range(3)])
         self.assertEqual([json.loads(p.read_text())["task_id"] for p in parts], [0, 1, 2])
+
+    def test_speculation_chooses_duplicate_and_only_its_map_partitions(self):
+        self.scheduler.speculate = True
+        self.scheduler.straggler_seconds = 0.05
+        # Worker 0 cannot finish map 0; Worker 1 becomes idle after map 1.
+        self.workers[0].gate.clear()
+        job_id = self.submit(maps=2, reduces=2)
+        self.scheduler.start()
+        result = self.finished(job_id)
+        self.assertEqual(result.state, boss_pb2.JOB_COMPLETED, result.error)
+        self.assertEqual((result.completed_maps, result.completed_reducers), (2, 2))
+        self.assertEqual(
+            [(r.task_id, r.attempt_id) for w in self.workers
+             for r, is_reduce in w.calls if not is_reduce],
+            [(0, 0), (1, 0), (0, 1)],
+        )
+        for w in self.workers:
+            for request, is_reduce in w.calls:
+                if is_reduce:
+                    self.assertIn("map_0_attempt_1_reduce_", request.input_paths[0])
+                    self.assertNotIn("map_0_attempt_0_reduce_", request.input_paths[0])
+        # The losing original is still running; reducers must not use its Worker.
+        self.assertEqual(self.workers[0].overlaps, 0)
+        self.assertEqual(len(self.workers[0].calls), 1)
+
+    def test_baseline_does_not_speculate_even_with_an_idle_worker(self):
+        self.workers[0].gate.clear()
+        job_id = self.submit(maps=2, reduces=1)
+        self.scheduler.start()
+        self.wait_for(lambda: self.status(job_id).completed_maps == 1)
+        Event().wait(0.12)
+        self.assertFalse(any(r.attempt_id == 1 for w in self.workers
+                             for r, is_reduce in w.calls if not is_reduce))
+        self.workers[0].gate.set()
+        self.assertEqual(self.finished(job_id).state, boss_pb2.JOB_COMPLETED)
+
+    def test_speculation_waits_for_peer_completion_and_reclaims_loser(self):
+        self.scheduler.speculate = True
+        self.scheduler.straggler_seconds = 0.05
+        for worker in self.workers:
+            worker.gate.clear()
+        job_id = self.submit(maps=2, reduces=1)
+        self.scheduler.start()
+        Event().wait(0.12)
+        self.assertFalse(any(r.attempt_id == 1 for w in self.workers
+                             for r, is_reduce in w.calls if not is_reduce))
+        self.workers[1].gate.set()
+        self.assertEqual(self.finished(job_id).state, boss_pb2.JOB_COMPLETED)
+        self.assertTrue(self.scheduler._lingering)
+        self.workers[0].gate.set()
+        next_job = self.submit("next", maps=2, reduces=1)
+        self.assertEqual(self.finished(next_job).state, boss_pb2.JOB_COMPLETED)
+        self.assertFalse(self.scheduler._lingering)
+        self.assertEqual([w.overlaps for w in self.workers], [0, 0])
+
+    def test_failed_speculative_attempt_can_fall_back_to_original(self):
+        self.scheduler.speculate = True
+        self.scheduler.straggler_seconds = 0.05
+        self.workers[0].gate.clear()
+        self.workers[1].fail_attempts.add((0, 1, False))
+        job_id = self.submit(maps=2, reduces=1)
+        self.scheduler.start()
+        self.wait_for(lambda: any(
+            r.task_id == 0 and r.attempt_id == 1
+            for r, is_reduce in self.workers[1].calls if not is_reduce
+        ))
+        self.workers[0].gate.set()
+        result = self.finished(job_id)
+        self.assertEqual(result.state, boss_pb2.JOB_COMPLETED, result.error)
+        self.assertEqual(result.completed_maps, 2)
+        reducer_requests = [r for w in self.workers for r, is_reduce in w.calls if is_reduce]
+        self.assertEqual(len(reducer_requests), 1)
+        self.assertIn("map_0_attempt_0_reduce_", reducer_requests[0].input_paths[0])
 
     def test_progress_and_fifo_jobs(self):
         self.workers[0].gate.clear()
