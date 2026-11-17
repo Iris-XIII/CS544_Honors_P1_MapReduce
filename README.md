@@ -12,8 +12,9 @@ Workers, it runs in API-only mode and jobs stay `JOB_QUEUED`.
 
 The Worker executes map/shuffle/reduce tasks asynchronously through gRPC. The
 scheduler supplies explicit reducer input files and publishes completed outputs.
-Self-contained tests exercise the full Boss/Worker pipeline. The client CLI,
-speculative execution, and Docker Compose deployment remain to be implemented.
+The client CLI submits jobs and monitors progress from outside the containers.
+Self-contained tests exercise the full Client/Boss/Worker pipeline. Speculative
+execution and Docker Compose deployment remain to be implemented.
 Job records live only in memory and are lost when the Boss restarts.
 
 ## Setup
@@ -70,7 +71,87 @@ identify a different Worker. Start each Worker with `python -m worker.worker`;
 [scheduler/Worker contract](docs/scheduler-worker-contract.md) documents the
 interface and shared paths.
 
-## Try submission and status lookup
+## Submit a job with the Client CLI
+
+Run the client on the host, with the virtual environment activated. Its default
+Boss address is `localhost:50050`; use `--boss HOST:PORT` to change it.
+
+```bash
+python client.py \
+  --input /shared/input/data.txt \
+  --output /shared/output/wordcount \
+  --job /shared/jobs/wordcount.py \
+  --maps 4 --reduces 2
+```
+
+The five submission arguments are required. Paths must be absolute **as seen by
+the Boss and Workers**. The client forwards them unchanged: it does not upload
+files, resolve local symlinks, or require the same paths to exist on the client.
+Place input and Python job files in shared storage first. Output must be a new
+or empty directory. The client loads its generated modules automatically, so
+`python client.py` does not itself require `PYTHONPATH`.
+
+The client prints the job ID immediately, then reports changes in job state and
+map/reduce completion counts. On success it prints the output directory. It
+waits for `JOB_COMPLETED`, including final file publication, before reporting
+success. Completed task counters alone are not sufficient.
+
+```bash
+# Submit and return immediately; exit 0 means accepted, not completed.
+python client.py --input /shared/input/data.txt \
+  --output /shared/output/another-job --job /shared/jobs/wordcount.py \
+  --maps 4 --reduces 2 --no-wait
+
+# Replace JOB_ID with the ID printed during submission.
+python client.py --status JOB_ID
+# Query just once instead of watching until completion:
+python client.py --status JOB_ID --no-wait
+
+# Bound monitoring time without cancelling the server-side job:
+python client.py --status JOB_ID --wait-timeout 60
+```
+
+`--status` never submits another job. It cannot be combined with the five
+submission arguments. `--poll-interval` defaults to 1 second, and `--rpc-timeout`
+defaults to 5 seconds per call. `--wait-timeout` limits monitoring after
+submission, with no limit by default; it cannot be combined with `--no-wait`.
+Ctrl+C stops the client but does not cancel the job. You can monitor it later
+using the printed ID. Submission RPCs are not retried automatically, because
+the Boss does not deduplicate submissions.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Completed successfully, or submission/status query succeeded with `--no-wait` |
+| `1` | Job failure, RPC error, or invalid server response |
+| `2` | Invalid command-line arguments |
+| `124` | Client monitoring timeout; job was not cancelled |
+| `130` | Client interrupted with Ctrl+C |
+
+### Local word-count example
+
+Until Docker Compose is added, run these commands from the repository root in
+three terminals, each with the virtual environment and `PYTHONPATH` configured
+as described above. These paths are host paths because all processes run locally.
+
+```bash
+# Terminal 1: Worker
+SHARED_ROOT="$PWD/shared" python -m worker.worker
+
+# Terminal 2: Boss, with scheduling enabled
+python -m boss.server --workers localhost:50051 \
+  --work-dir "$PWD/shared/intermediate"
+
+# Terminal 3: Client (use a different output directory for each run)
+python client.py --input "$PWD/examples/data/input.txt" \
+  --output "$PWD/shared/output/wordcount" \
+  --job "$PWD/examples/wordcount.py" --maps 4 --reduces 2
+```
+
+Expect word counts `hello=2`, `world=3`, `mapreduce=1`, `distributed=1`, and
+`computing=1` across the output partition files. Run `python client.py --help`
+for all options.
+
+## Try the Boss API directly
 
 Start the Boss **without `--workers`** for this registration-only example.
 In another terminal, activate the environment and set `PYTHONPATH` as above.
@@ -166,6 +247,11 @@ the temporary example above is only for registration testing.
    their own Boss and four Worker servers on available ports.
    They check word count across task counts, empty input, a second user-defined
    job, and exclusion of unselected attempt outputs.
+8. **`client.py`: the host-side CLI.** Parses job settings, submits once, and polls
+   the Boss until completion or failure. It also supports monitoring existing jobs.
+9. **`tests/test_client.py`: CLI checks.** Runs the client as a separate process
+   against isolated Boss and Worker servers, including word count, resuming by ID,
+   failures, input validation, monitoring timeout, and interruption handling.
 
 ## Baseline scheduler behavior
 
