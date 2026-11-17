@@ -9,6 +9,8 @@ from pathlib import Path
 import mapreduce_pb2 as pb2
 from worker_test_utils import running_worker
 
+from unittest.mock import patch
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -56,6 +58,76 @@ class TestWorkerIntegration(unittest.TestCase):
         self.addCleanup(
             lambda: worker_context.__exit__(None, None, None)
         )
+
+
+    
+    def test_configurable_map_straggler_delay(self):
+        """Only the configured map task and attempt should be delayed."""
+
+        from worker import worker as worker_module
+
+        input_path = ROOT / "examples/data/input.txt"
+        job_file = ROOT / "examples/wordcount.py"
+
+        # Use a mocked sleep to avoid an actual 8-second wait.
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "MAP_DELAY_SECONDS": "8",
+                    "MAP_DELAY_TASK_ID": "0",
+                    "MAP_DELAY_ATTEMPT_ID": "0",
+                },
+            ),
+            patch.object(worker_module.time, "sleep") as mock_sleep,
+        ):
+            job_id = f"delay_{uuid.uuid4().hex}"
+
+            # Attempt 0 of map task 0 should be delayed.
+            # Attempt 1 of the same task should not.
+            # Map task 1 should not be delayed.
+            cases = [
+                (0, 0),
+                (0, 1),
+                (1, 0),
+            ]
+
+            for task_id, attempt_id in cases:
+                response = self.stub.RunMap(
+                    pb2.MapTaskRequest(
+                        job_id=job_id,
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        input_path=str(input_path),
+                        job_file=str(job_file),
+                        num_reducers=2,
+                        start_line=0,
+                        end_line=2,
+                    ),
+                    timeout=5,
+                )
+                self.assertTrue(response.accepted)
+
+            for task_id, attempt_id in cases:
+                status = wait_for_completion(
+                    self.stub,
+                    job_id,
+                    task_id,
+                    is_reduce=False,
+                    attempt_id=attempt_id,
+                )
+                self.assertTrue(Path(status.output_path).is_dir())
+
+            # Only the matching task/attempt should sleep.
+            mock_sleep.assert_any_call(8.0)
+
+            delay_calls = [
+                call
+                for call in mock_sleep.call_args_list
+                if call.args == (8.0,)
+            ]
+            self.assertEqual(len(delay_calls), 1)
+
 
     def test_map_reduce_over_grpc(self):
         """Verify the complete map -> shuffle -> reduce pipeline."""

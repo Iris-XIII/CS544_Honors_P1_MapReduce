@@ -1,0 +1,9 @@
+
+services:
+  worker1:
+    environment:
+      SHARED_ROOT: /shared
+      WORKER_PORT: "50051"
+      MAP_DELAY_SECONDS: "8"
+      MAP_DELAY_TASK_ID: "0"
+      MAP_DELAY_ATTEMPT_ID: "0"
