@@ -2,8 +2,8 @@
 
 The scheduler follows Iris's PR #5 shuffle/reducer code and PR #6 executing
 Worker interface. It uses PR #6's `ReduceTaskRequest.input_paths` field instead
-of the earlier manifest proposal. The Worker implementation is still awaiting
-review on `iris/worker-integration`; it is not merged by this scheduler change.
+of the earlier manifest proposal. The executing Worker and its self-contained
+tests reached `main` through PR #8 and are included in this branch.
 
 ## Assignment and status
 

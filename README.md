@@ -10,14 +10,11 @@ With configured Workers, it runs one job at a time, dispatches maps, waits for a
 maps, then dispatches reducers and publishes their outputs. Without configured
 Workers, it runs in API-only mode and jobs stay `JOB_QUEUED`.
 
-The checked-in Worker RPC server is still an acceptance/status skeleton. The
-standalone map/shuffle/reduce pipeline from PR #5 is present. The scheduler now
-matches the executing Worker interface in PR #6, including its `input_paths`
-protobuf addition; PR #6's Worker implementation remains on Iris's branch pending
-review. Self-contained Boss/Worker tests are included and activate when that
-implementation is present. The client CLI, speculative execution, and Docker
-Compose deployment remain to be implemented. Job records live only in memory
-and are lost when the Boss restarts.
+The Worker executes map/shuffle/reduce tasks asynchronously through gRPC. The
+scheduler supplies explicit reducer input files and publishes completed outputs.
+Self-contained tests exercise the full Boss/Worker pipeline. The client CLI,
+speculative execution, and Docker Compose deployment remain to be implemented.
+Job records live only in memory and are lost when the Boss restarts.
 
 ## Setup
 
@@ -67,10 +64,11 @@ python -m boss.server \
 
 Those hostnames are illustrative container addresses; Docker Compose is not set
 up yet. With local Workers use their actual host/port addresses. Each address must
-identify a different Worker. The current skeleton will remain pending until the
-task timeout fails the job. Real jobs require the executing Worker from PR #6;
-the [scheduler/Worker contract](docs/scheduler-worker-contract.md) documents the
-aligned interface and shared paths.
+identify a different Worker. Start each Worker with `python -m worker.worker`;
+`WORKER_PORT` controls its port and `SHARED_ROOT` controls its shared-storage root
+(defaults: `50051` and `/shared`). The
+[scheduler/Worker contract](docs/scheduler-worker-contract.md) documents the
+interface and shared paths.
 
 ## Try submission and status lookup
 
@@ -164,11 +162,10 @@ the temporary example above is only for registration testing.
    task distribution, line ranges, the map/reduce barrier, FIFO job order, output
    partition selection, progress, publication, failures, timeouts, and shutdown. They
    do not test the real Worker execution algorithms.
-7. **`tests/test_boss_worker_integration.py`: real execution.** With PR #6's Worker,
-   these tests start their own Boss and four Worker servers on available ports.
+7. **`tests/test_boss_worker_integration.py`: real execution.** These tests start
+   their own Boss and four Worker servers on available ports.
    They check word count across task counts, empty input, a second user-defined
-   job, and exclusion of unselected attempt outputs. They skip explicitly while
-   only the Worker skeleton is present.
+   job, and exclusion of unselected attempt outputs.
 
 ## Baseline scheduler behavior
 
@@ -208,22 +205,7 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 The GitHub Actions workflow runs these tests on PRs and checks that generated Boss
-and Worker protobuf files match their sources. Our RPC/integration tests manage
-their own servers and temporary storage, so no separate CI server is needed for
-them. PR #6's own `test_worker_integration.py` still needs Iris's fixture update
-before the combined full suite can run without an externally started Worker.
-
-The existing Worker RPC test is a standalone
-script, not a unittest case. Run it separately with a fresh Worker server:
-
-```bash
-# Terminal 1 (environment and PYTHONPATH set as above)
-python -m worker.worker
-# Terminal 2 (same setup)
-python tests/test_worker_rpc.py
-```
-
-Restart the Worker before repeating its smoke test, because it uses fixed task
-IDs and the Worker deliberately rejects duplicate attempts. That smoke test
-targets the skeleton's `PENDING` behavior and also needs updating in PR #6 for
-asynchronous execution.
+and Worker protobuf files match their sources. All RPC/integration tests manage
+their own servers, available ports, and temporary storage. No separately started
+Worker is needed locally or in CI. The Worker RPC tests are included in unittest
+discovery and handle asynchronous execution states.
