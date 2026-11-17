@@ -9,6 +9,7 @@ import grpc
 import boss_pb2
 import boss_pb2_grpc
 from boss.jobs import JobSpec, JobStore
+from boss.scheduler import Scheduler
 
 
 def validate_submission(request) -> JobSpec:
@@ -106,14 +107,36 @@ def create_server(address="[::]:50050", store=None):
 def main():
     parser = argparse.ArgumentParser(description="MapReduce Boss gRPC server")
     parser.add_argument("--address", default="[::]:50050", help="gRPC bind address")
+    parser.add_argument("--workers", nargs="+", help="Worker host:port addresses; omit for API-only mode")
+    parser.add_argument("--work-dir", default="/shared/intermediate", help="Shared scheduler workspace")
+    parser.add_argument("--poll-interval", type=float, default=0.2)
+    parser.add_argument("--rpc-timeout", type=float, default=3.0)
+    parser.add_argument("--task-timeout", type=float, default=300.0)
     args = parser.parse_args()
-    server, port = create_server(args.address)
-    server.start()
-    print(f"[Boss] Listening on {args.address} (port {port})", flush=True)
+    store = JobStore()
+    scheduler = None
+    if args.workers:
+        try:
+            scheduler = Scheduler(
+                store, args.workers, args.work_dir, args.poll_interval,
+                args.rpc_timeout, args.task_timeout,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    server, port = create_server(args.address, store)
     try:
+        if scheduler:
+            scheduler.start()
+        server.start()
+        mode = "scheduling enabled" if scheduler else "API-only; jobs stay queued"
+        print(f"[Boss] Listening on {args.address} (port {port}); {mode}", flush=True)
         server.wait_for_termination()
     except KeyboardInterrupt:
+        pass
+    finally:
         server.stop(grace=2).wait()
+        if scheduler:
+            scheduler.stop()
 
 
 if __name__ == "__main__":

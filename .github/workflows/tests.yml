@@ -19,7 +19,11 @@ jobs:
         run: |
           python -m grpc_tools.protoc -Iproto --python_out=proto --grpc_python_out=proto proto/boss.proto
           git diff --exit-code -- proto/boss_pb2.py proto/boss_pb2_grpc.py
-      - name: Run unit and Boss RPC tests
+      - name: Verify generated Worker protobuf files
+        run: |
+          python -m grpc_tools.protoc -Iproto --python_out=proto --grpc_python_out=proto proto/mapreduce.proto
+          git diff --exit-code -- proto/mapreduce_pb2.py proto/mapreduce_pb2_grpc.py
+      - name: Run discovered tests (fixtures manage their own servers)
         env:
           PYTHONPATH: proto:.
         run: python -m unittest discover -s tests -p 'test_*.py' -v
